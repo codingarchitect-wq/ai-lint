@@ -1,13 +1,14 @@
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
-import { generateText, type LanguageModelV1, Output } from 'ai'
+import { generateText, type LanguageModel, Output } from 'ai'
 import { z } from 'zod'
-import type { LintJob, LintResult, Model } from './types.js'
+import type { LintJob, LintResult, Model, OpenRouterModel, Provider } from './types.js'
 
 function getOpenRouter() {
   return createOpenRouter({ apiKey: process.env.OPEN_ROUTER_KEY })
 }
 
-const MODEL_MAP: Record<Model, string> = {
+const MODEL_MAP: Record<OpenRouterModel, string> = {
   'gemini-flash': 'google/gemini-2.5-flash',
   haiku: 'anthropic/claude-haiku-4.5',
   sonnet: 'anthropic/claude-sonnet-4.5',
@@ -28,13 +29,41 @@ const lintResponseSchema = z.object({
   line: z.number().nullable(),
 })
 
+interface AnthropicClientOptions {
+  provider: Provider
+  providerUrl?: string
+  defaultModel: Model
+}
+
 export class AnthropicClient {
-  constructor(private defaultModel: Model) {}
+  private provider: Provider
+  private providerUrl?: string
+  private defaultModel: Model
+
+  constructor(options: AnthropicClientOptions) {
+    this.provider = options.provider
+    this.providerUrl = options.providerUrl
+    this.defaultModel = options.defaultModel
+  }
+
+  private resolveModel(modelName: Model): LanguageModel {
+    if (this.provider === 'ollama') {
+      const ollama = createOpenAICompatible({
+        name: 'ollama',
+        baseURL: this.providerUrl ?? 'http://localhost:11434/v1',
+        supportsStructuredOutputs: true,
+      })
+      return ollama(modelName)
+    }
+
+    const modelId = MODEL_MAP[modelName as OpenRouterModel]
+    return getOpenRouter()(modelId)
+  }
 
   async lint(job: LintJob): Promise<LintResult> {
     const startTime = Date.now()
-    const model = job.rule.model ?? this.defaultModel
-    const modelId = MODEL_MAP[model]
+    const modelName = job.rule.model ?? this.defaultModel
+    const model = this.resolveModel(modelName)
 
     const ext = job.filePath.split('.').pop() || 'txt'
 
@@ -47,7 +76,7 @@ ${job.fileContent}
 \`\`\``
 
     try {
-      const response = await this.callApiWithRetry(getOpenRouter()(modelId), userMessage)
+      const response = await this.callApiWithRetry(model, userMessage)
       const durationMs = Date.now() - startTime
 
       return {
@@ -65,12 +94,23 @@ ${job.fileContent}
       const durationMs = Date.now() - startTime
 
       if (
+        this.provider === 'openrouter' &&
         error instanceof Error &&
         (error.message.includes('401') ||
           error.message.includes('Unauthorized') ||
           error.message.includes('API key'))
       ) {
         throw new Error('OPEN_ROUTER_KEY is invalid or missing')
+      }
+
+      if (
+        this.provider === 'ollama' &&
+        error instanceof Error &&
+        (error.message.includes('ECONNREFUSED') || error.message.includes('fetch failed'))
+      ) {
+        throw new Error(
+          `Cannot connect to Ollama at ${this.providerUrl ?? 'http://localhost:11434/v1'}. Is Ollama running?`,
+        )
       }
 
       return {
@@ -88,7 +128,7 @@ ${job.fileContent}
   }
 
   private async callApiWithRetry(
-    model: LanguageModelV1,
+    model: LanguageModel,
     userMessage: string,
     attempt = 1,
   ): Promise<z.infer<typeof lintResponseSchema>> {
@@ -99,7 +139,7 @@ ${job.fileContent}
         system: SYSTEM_PROMPT,
         prompt: userMessage,
         temperature: 0,
-        maxTokens: 1024,
+        maxOutputTokens: 1024,
       })
 
       if (!output) {
@@ -110,7 +150,9 @@ ${job.fileContent}
     } catch (error) {
       const isRetryable =
         error instanceof Error &&
-        (/429|rate.limit/i.test(error.message) || /5\d{2}|server.error/i.test(error.message))
+        (/429|rate.limit/i.test(error.message) ||
+          /5\d{2}|server.error/i.test(error.message) ||
+          /ECONNREFUSED|fetch failed/i.test(error.message))
 
       if (isRetryable && attempt < 3) {
         const delayMs = 1000 * 2 ** (attempt - 1)
